@@ -32,6 +32,7 @@ export class MemStore implements Store {
       id: randomUUID(), type: spec.type, payload: spec.payload, priority: spec.priority,
       status: "ready", agentId: spec.agentId, idempotencyKey: spec.idempotencyKey,
       attempts: 0, maxAttempts: spec.maxAttempts ?? 3, runAfter: new Date(0),
+      estimatedCostGbp: null,
     };
     this.tasks.set(task.id, task);
     if (spec.idempotencyKey) this.byKey.set(spec.idempotencyKey, task.id);
@@ -82,6 +83,23 @@ export class MemStore implements Store {
     return t;
   }
 
+  async blockForBudget(taskId: string, estimatedCostGbp: number | null) {
+    const t = this.tasks.get(taskId); if (!t) return;
+    t.status = "budget_blocked";
+    t.estimatedCostGbp = estimatedCostGbp;
+  }
+
+  async listBudgetBlocked(agentIds: string[], limit: number) {
+    return [...this.tasks.values()]
+      .filter((t) => t.status === "budget_blocked" && t.agentId !== null && agentIds.includes(t.agentId))
+      .slice(0, limit);
+  }
+
+  async unblock(taskId: string) {
+    const t = this.tasks.get(taskId); if (!t) return;
+    if (t.status === "budget_blocked") t.status = "ready";
+  }
+
   async holdForApproval(taskId: string) {
     const t = this.tasks.get(taskId); if (!t) return;
     t.status = "awaiting_approval";
@@ -127,6 +145,21 @@ export class MemStore implements Store {
   }
 
   async getBudget(id: string) { return this.budgets.get(id) ?? null; }
+
+  async reserve(budgetId: string, gbp: number): Promise<boolean> {
+    const b = this.budgets.get(budgetId);
+    if (!b) return false; // no budget configured for paid work = fail closed
+    // strict >: a budget exactly at its ceiling admits no further paid work
+    if (b.spentGbp + b.reservedGbp + gbp > b.limitGbp + 1e-9) return false;
+    b.reservedGbp = Math.round((b.reservedGbp + gbp) * 100) / 100;
+    return true;
+  }
+
+  async settleSpend(budgetId: string, reservedGbp: number, actualGbp: number) {
+    const b = this.budgets.get(budgetId); if (!b) return;
+    b.reservedGbp = Math.max(0, Math.round((b.reservedGbp - reservedGbp) * 100) / 100);
+    b.spentGbp = Math.round((b.spentGbp + actualGbp) * 100) / 100;
+  }
 
   async addSpend(budgetId: string, gbp: number) {
     const b = this.budgets.get(budgetId);

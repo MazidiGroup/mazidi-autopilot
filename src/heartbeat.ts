@@ -16,6 +16,7 @@
  * heartbeat twice does exactly what running it once does.
  */
 import type { AgentAdapter } from "./agents.js";
+import { DEFAULT_ESTIMATES, estimateCost, type EstimateTable } from "./estimates.js";
 import { decide, DEFAULT_CONFIG, type PolicyConfig } from "./policy.js";
 import { agentForTask, tasksForEvent } from "./router.js";
 import type { Store } from "./store.js";
@@ -23,16 +24,20 @@ import type { Store } from "./store.js";
 export interface HeartbeatOptions {
   batch?: number;
   policy?: PolicyConfig;
-  /** Budget drawn on by agent spend. */
+  /** Budget drawn on by agent spend. Required for any paid work to run. */
   spendBudgetId?: string;
   /** Backoff base in ms; attempt n waits base * 2^(n-1). */
   backoffBaseMs?: number;
+  /** Cost estimates by task/agent. Configuration, not code. */
+  estimates?: EstimateTable;
 }
 
 export interface HeartbeatSummary {
   eventsIngested: number;
   tasksCreated: number;
   tasksGated: number;
+  tasksBudgetBlocked: number;
+  tasksUnblocked: number;
   tasksClaimed: number;
   runsSucceeded: number;
   runsFailed: number;
@@ -47,8 +52,10 @@ export async function heartbeat(
   const batch = opts.batch ?? 25;
   const policy = opts.policy ?? DEFAULT_CONFIG;
   const backoffBase = opts.backoffBaseMs ?? 60_000;
+  const estimates = opts.estimates ?? DEFAULT_ESTIMATES;
   const summary: HeartbeatSummary = {
     eventsIngested: 0, tasksCreated: 0, tasksGated: 0,
+    tasksBudgetBlocked: 0, tasksUnblocked: 0,
     tasksClaimed: 0, runsSucceeded: 0, runsFailed: 0, spendGbp: 0,
   };
 
@@ -88,10 +95,29 @@ export async function heartbeat(
     await store.setCursor({ lastAt: ev.at, lastId: ev.id });
   }
 
-  // ── 3. claim ───────────────────────────────────────────
+  // ── 3a. unblock ────────────────────────────────────────
+  // budget_blocked work re-enters ready when headroom exists again. Checked
+  // against the budget read-only here; the authoritative reservation still
+  // happens at execution time, so this can never over-admit.
   const configured = adapters.filter((a) => a.isConfigured());
   const byId = new Map(configured.map((a) => [a.agentId, a]));
   const claimable = configured.map((a) => a.agentId);
+  if (claimable.length && opts.spendBudgetId) {
+    const budget = await store.getBudget(opts.spendBudgetId);
+    if (budget) {
+      const headroom = budget.limitGbp - budget.spentGbp - budget.reservedGbp;
+      for (const t of await store.listBudgetBlocked(claimable, batch)) {
+        const est = estimateCost(t.type, t.agentId!, estimates);
+        if (est !== null && est <= headroom + 1e-9) {
+          await store.unblock(t.id);
+          await store.audit("heartbeat", "task.unblocked", "task", t.id, { estimate: est });
+          summary.tasksUnblocked++;
+        }
+      }
+    }
+  }
+
+  // ── 3b. claim ──────────────────────────────────────────
   const tasks = claimable.length ? await store.claimDue(claimable, batch) : [];
   summary.tasksClaimed = tasks.length;
 
@@ -99,6 +125,41 @@ export async function heartbeat(
   for (const task of tasks) {
     const adapter = byId.get(task.agentId!);
     if (!adapter) continue; // cannot happen; claimDue filters — belt and braces
+
+    // ── budget reservation, before any execution ─────────
+    const estimate = estimateCost(task.type, task.agentId!, estimates);
+
+    if (estimate === null) {
+      // A paid agent with no estimate fails CLOSED. "We forgot to price this"
+      // must never mean "it runs for free". Parks visibly, burns no attempt.
+      await store.blockForBudget(task.id, null);
+      await store.audit("policy", "task.budget_blocked", "task", task.id,
+        { reason: "no cost estimate for paid agent" });
+      summary.tasksBudgetBlocked++;
+      continue;
+    }
+
+    let reserved = 0;
+    if (estimate > 0) {
+      if (!opts.spendBudgetId) {
+        await store.blockForBudget(task.id, estimate);
+        await store.audit("policy", "task.budget_blocked", "task", task.id,
+          { reason: "paid work with no budget configured", estimate });
+        summary.tasksBudgetBlocked++;
+        continue;
+      }
+      const ok = await store.reserve(opts.spendBudgetId, estimate);
+      if (!ok) {
+        await store.blockForBudget(task.id, estimate);
+        await store.audit("policy", "task.budget_blocked", "task", task.id,
+          { reason: "budget cannot admit estimate", estimate });
+        summary.tasksBudgetBlocked++;
+        continue;
+      }
+      reserved = estimate;
+    }
+    // estimate === 0: deterministic work runs even at a budget ceiling.
+
     const run = await store.startRun(task.id, task.agentId!);
     try {
       const result = await adapter.execute(task.type, task.payload);
@@ -106,8 +167,16 @@ export async function heartbeat(
         status: "succeeded", outcome: result.outcome,
         costGbp: result.costGbp, tokens: result.tokens,
       });
-      if (opts.spendBudgetId && result.costGbp > 0) {
-        await store.addSpend(opts.spendBudgetId, result.costGbp);
+      if (opts.spendBudgetId && (reserved > 0 || result.costGbp > 0)) {
+        await store.settleSpend(opts.spendBudgetId, reserved, result.costGbp);
+        if (result.costGbp > reserved) {
+          // Overage is recorded loudly; the budget arithmetic already blocks
+          // subsequent work until headroom returns or the limit is raised.
+          await store.audit("policy", "budget.overage", "task", task.id, {
+            estimate: reserved, actual: result.costGbp,
+            overage: Math.round((result.costGbp - reserved) * 100) / 100,
+          });
+        }
       }
       summary.spendGbp += result.costGbp;
       await store.completeTask(task.id);
@@ -116,6 +185,11 @@ export async function heartbeat(
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
       await store.finishRun(run.id, { status: "failed", error: message });
+      if (opts.spendBudgetId && reserved > 0) {
+        // Failed runs release their reservation; any real cost incurred before
+        // the failure is still recorded as spend.
+        await store.settleSpend(opts.spendBudgetId, reserved, 0);
+      }
       const after = await store.failTask(task.id, {
         retryInMs: backoffBase * 2 ** task.attempts,
       });

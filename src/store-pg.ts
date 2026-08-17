@@ -27,6 +27,8 @@ const T = (r: Record<string, unknown>): Task => ({
   attempts: r["attempts"] as number,
   maxAttempts: r["max_attempts"] as number,
   runAfter: r["run_after"] as Date,
+  estimatedCostGbp: r["estimated_cost_gbp"] === null || r["estimated_cost_gbp"] === undefined
+    ? null : Number(r["estimated_cost_gbp"]),
 });
 
 export class PgStore implements Store {
@@ -79,34 +81,46 @@ export class PgStore implements Store {
   }
 
   async claimDue(agentIds: string[], limit: number): Promise<Task[]> {
-    // FOR UPDATE SKIP LOCKED: concurrent heartbeats each claim disjoint rows.
-    // Concurrency cap enforced by counting running runs per agent in the same
-    // statement, so the cap holds even across concurrent claimers.
-    const rows = await this.q(
-      `WITH capacity AS (
-         SELECT a.id, a.max_concurrency - COUNT(r.id) FILTER (WHERE r.status = 'running') AS free
-         FROM autopilot.agent a
-         LEFT JOIN autopilot.run r ON r.agent_id = a.id AND r.status = 'running'
-         WHERE a.enabled AND a.id = ANY($1)
-         GROUP BY a.id, a.max_concurrency
-       ),
-       picked AS (
-         SELECT t.id,
-                ROW_NUMBER() OVER (PARTITION BY t.agent_id ORDER BY t.priority DESC, t.created_at) AS rn,
-                c.free
-         FROM autopilot.task t
-         JOIN capacity c ON c.id = t.agent_id
-         WHERE t.status = 'ready' AND t.run_after <= now()
-         FOR UPDATE OF t SKIP LOCKED
-       )
-       UPDATE autopilot.task t
-       SET status = 'running', updated_at = now()
-       FROM picked p
-       WHERE t.id = p.id AND p.rn <= p.free AND t.status = 'ready'
-       RETURNING t.*`,
-      [agentIds],
-    );
-    return rows.slice(0, limit).map(T);
+    // One locked-subquery claim per agent. The inner SELECT takes row locks
+    // with FOR UPDATE SKIP LOCKED (no window functions — Postgres rejects
+    // FOR UPDATE in a query level that has them), the LIMIT is enforced in
+    // SQL before anything is marked running, and the outer UPDATE re-checks
+    // status='ready' so a row that changed between lock and update is left
+    // alone. Concurrent heartbeats claim disjoint rows via SKIP LOCKED.
+    //
+    // Per-agent free capacity is computed first from running runs; an agent
+    // at capacity claims LIMIT 0, i.e. nothing.
+    const agents = await this.listAgents();
+    const running = await this.runningCountByAgent();
+
+    const claimed: Task[] = [];
+    let remaining = limit;
+    for (const agent of agents) {
+      if (remaining <= 0) break;
+      if (!agentIds.includes(agent.id)) continue;
+      const free = Math.min(
+        remaining,
+        Math.max(0, agent.maxConcurrency - (running.get(agent.id) ?? 0)),
+      );
+      if (free <= 0) continue;
+      const rows = await this.q(
+        `UPDATE autopilot.task t
+         SET status = 'running', updated_at = now()
+         FROM (
+           SELECT id FROM autopilot.task
+           WHERE status = 'ready' AND run_after <= now() AND agent_id = $1
+           ORDER BY priority DESC, created_at
+           LIMIT $2
+           FOR UPDATE SKIP LOCKED
+         ) picked
+         WHERE t.id = picked.id AND t.status = 'ready'
+         RETURNING t.*`,
+        [agent.id, free],
+      );
+      for (const r of rows) claimed.push(T(r));
+      remaining -= rows.length;
+    }
+    return claimed;
   }
 
   async completeTask(taskId: string): Promise<void> {
@@ -124,6 +138,31 @@ export class PgStore implements Store {
       [taskId, opts.retryInMs],
     );
     return T(rows[0]!);
+  }
+
+  async blockForBudget(taskId: string, estimatedCostGbp: number | null): Promise<void> {
+    await this.q(
+      `UPDATE autopilot.task SET status='budget_blocked', estimated_cost_gbp=$2, updated_at=now() WHERE id=$1`,
+      [taskId, estimatedCostGbp],
+    );
+  }
+
+  async listBudgetBlocked(agentIds: string[], limit: number): Promise<Task[]> {
+    const rows = await this.q(
+      `SELECT * FROM autopilot.task
+       WHERE status='budget_blocked' AND agent_id = ANY($1)
+       ORDER BY created_at LIMIT $2`,
+      [agentIds, limit],
+    );
+    return rows.map(T);
+  }
+
+  async unblock(taskId: string): Promise<void> {
+    await this.q(
+      `UPDATE autopilot.task SET status='ready', updated_at=now()
+       WHERE id=$1 AND status='budget_blocked'`,
+      [taskId],
+    );
   }
 
   async holdForApproval(taskId: string): Promise<void> {
@@ -183,7 +222,33 @@ export class PgStore implements Store {
     return {
       id: r["id"] as string, period: r["period"] as Budget["period"],
       limitGbp: Number(r["limit_gbp"]), spentGbp: Number(r["spent_gbp"]),
+      reservedGbp: Number(r["reserved_gbp"] ?? 0),
     };
+  }
+
+  async reserve(budgetId: string, gbp: number): Promise<boolean> {
+    // Check-and-reserve in ONE statement: the WHERE clause is the guard, so
+    // two concurrent reservations serialise on the row and the second sees
+    // the first's reservation. Strict inequality via <=: a budget exactly at
+    // its ceiling admits nothing further.
+    const rows = await this.q(
+      `UPDATE autopilot.budget
+       SET reserved_gbp = reserved_gbp + $2
+       WHERE id = $1 AND spent_gbp + reserved_gbp + $2 <= limit_gbp
+       RETURNING id`,
+      [budgetId, gbp],
+    );
+    return rows.length === 1;
+  }
+
+  async settleSpend(budgetId: string, reservedGbp: number, actualGbp: number): Promise<void> {
+    await this.q(
+      `UPDATE autopilot.budget
+       SET reserved_gbp = GREATEST(0, reserved_gbp - $2),
+           spent_gbp = spent_gbp + $3
+       WHERE id = $1`,
+      [budgetId, reservedGbp, actualGbp],
+    );
   }
 
   async addSpend(budgetId: string, gbp: number): Promise<void> {

@@ -85,7 +85,7 @@ test("unconfigured agents queue work instead of burning attempts", async () => {
 
 test("configured agents execute, record runs, and spend lands on the budget", async () => {
   const store = seeded();
-  store.budgets.set("agent_spend_daily", { id: "agent_spend_daily", period: "daily", limitGbp: 10, spentGbp: 0 });
+  store.budgets.set("agent_spend_daily", { id: "agent_spend_daily", period: "daily", limitGbp: 10, spentGbp: 0, reservedGbp: 0 });
   const growth = new FakeAdapter("claude-growth", { costGbp: 0.25 });
   const strat = new FakeAdapter("gpt-strategist", { costGbp: 0.1 });
 
@@ -104,8 +104,10 @@ test("a failing agent retries with growing backoff, then fails at max attempts",
   store.agents = [AGENTS[0]!];
   store.outbox = [outboxRow("e1", "coach.signed_up", "2026-08-15T10:00:00Z", { customerId: "c1" })];
   const flaky = new FakeAdapter("claude-growth", { failTimes: 99 }); // always fails
+  store.budgets.set("agent_spend_daily", { id: "agent_spend_daily", period: "daily", limitGbp: 100, spentGbp: 0, reservedGbp: 0 });
+  const opts = { spendBudgetId: "agent_spend_daily" };
 
-  await heartbeat(store, [flaky]); // ingest + attempt 1
+  await heartbeat(store, [flaky], opts); // ingest + attempt 1
   let task = [...store.tasks.values()][0]!;
   assert.equal(task.attempts, 1);
   assert.equal(task.status, "ready", "retryable after first failure");
@@ -113,13 +115,13 @@ test("a failing agent retries with growing backoff, then fails at max attempts",
   assert.ok(firstRunAfter > Date.now(), "backoff scheduled in the future");
 
   task.runAfter = new Date(0); // due again
-  await heartbeat(store, [flaky]); // attempt 2
+  await heartbeat(store, [flaky], opts); // attempt 2
   task = [...store.tasks.values()][0]!;
   assert.equal(task.attempts, 2);
   assert.equal(task.status, "ready");
 
   task.runAfter = new Date(0);
-  await heartbeat(store, [flaky]); // attempt 3 = max
+  await heartbeat(store, [flaky], opts); // attempt 3 = max
   task = [...store.tasks.values()][0]!;
   assert.equal(task.attempts, 3);
   assert.equal(task.status, "failed", "terminal after max attempts");
@@ -170,7 +172,8 @@ test("gated task types become approvals, not actions", async () => {
 
 test("audit trail records creation, completion and failures", async () => {
   const store = seeded();
-  await heartbeat(store, [new FakeAdapter("claude-growth"), new FakeAdapter("gpt-strategist")]);
+  store.budgets.set("agent_spend_daily", { id: "agent_spend_daily", period: "daily", limitGbp: 100, spentGbp: 0, reservedGbp: 0 });
+  await heartbeat(store, [new FakeAdapter("claude-growth"), new FakeAdapter("gpt-strategist")], { spendBudgetId: "agent_spend_daily" });
   const actions = store.auditLog.map((a) => a.action);
   assert.ok(actions.includes("task.created"));
   assert.ok(actions.includes("task.completed"));

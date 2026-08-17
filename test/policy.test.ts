@@ -27,7 +27,7 @@ test("budget exhaustion requires approval", () => {
   const d = decide({
     action: "research_prospect",
     estimatedCostGbp: 10,
-    budget: { id: "agent_spend_daily", period: "daily", limitGbp: 20, spentGbp: 15 },
+    budget: { id: "agent_spend_daily", period: "daily", limitGbp: 20, spentGbp: 15, reservedGbp: 0 },
   });
   assert.equal(d.verdict, "require_approval");
 });

@@ -1,7 +1,8 @@
 /** Shared domain types for the control plane. */
 
 export type TaskStatus =
-  | "ready" | "running" | "awaiting_approval" | "completed" | "failed" | "cancelled";
+  | "ready" | "running" | "awaiting_approval" | "budget_blocked"
+  | "completed" | "failed" | "cancelled";
 
 export interface Task {
   id: string;
@@ -14,6 +15,8 @@ export interface Task {
   attempts: number;
   maxAttempts: number;
   runAfter: Date;
+  /** Reserved against the budget before execution; null = not estimated yet. */
+  estimatedCostGbp: number | null;
 }
 
 export interface Run {
@@ -47,7 +50,10 @@ export interface Budget {
   id: string;
   period: "daily" | "monthly";
   limitGbp: number;
+  /** Actual, settled spend. */
   spentGbp: number;
+  /** Estimated spend of in-flight work, held until each run settles. */
+  reservedGbp: number;
 }
 
 /** A row read from the platform's public."OutboxEvent" (read-only here). */
